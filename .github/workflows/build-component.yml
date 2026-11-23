@@ -39,8 +39,9 @@ jobs:
       - name: Check inputs
         run: |
           [[ "$PGADMIN" =~ ^([0-9]+)\.([0-9]+)(\.post[0-9]+)?$ ]] || { echo "::error::Invalid pgAdmin version"; exit 1; }
+          tag="REL-${BASH_REMATCH[1]}_${BASH_REMATCH[2]}"
           [[ "$BUILD" =~ ^[1-9][0-9]*$ ]] || { echo "::error::Invalid build number"; exit 1; }
-          echo "SOURCE_TAG=REL-${BASH_REMATCH[1]}_${BASH_REMATCH[2]}" >> "$GITHUB_ENV"
+          echo "SOURCE_TAG=$tag" >> "$GITHUB_ENV"
 
       - name: Check out pgAdmin's release source
         if: inputs.build_frontend
