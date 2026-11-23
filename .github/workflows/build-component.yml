@@ -107,6 +107,7 @@ jobs:
             echo "- pgAdmin: official wheel from PyPI, checked against PyPI's SHA-256"
             echo "- Interface: $interface"
             echo "- Python: python-build-standalone, pinned in pins.json at $GITHUB_SHA"
+            echo "- Dependencies: versions pinned in constraints/$PGADMIN.txt at $GITHUB_SHA"
             echo
             echo '```'
             for file in *.zip; do echo "$(sha256sum "$file" | cut -d' ' -f1)  $(stat -c %s "$file")  $file"; done

@@ -6,6 +6,10 @@ wheel, packs the result in Arcnix's component format, then starts the packed
 backend once to check it. Uses only the standard library; run with
 `python3 -I build.py ...`.
 
+Dependency versions are pinned in `constraints/<version>.txt`. For a new
+pgAdmin version, run once with `--freeze` to resolve and write that file,
+review it, and commit it before building.
+
 A wheel without pgAdmin's compiled interface is refused. Pass `--frontend`
 with the `web` folder of the same release, already built, only when pgAdmin
 has published such a wheel.
@@ -18,6 +22,7 @@ from pathlib import Path, PurePosixPath
 import re
 import secrets
 import socket
+import sqlite3
 import stat
 import subprocess
 import tarfile
@@ -37,6 +42,18 @@ SKIP_BIN = re.compile(r"^(pip|idle|pydoc|2to3|python.*-config)")
 KEEP_DISCOVERY = re.compile(r"^(sqladmin.*|compute\.v1\.json|cloudresourcemanager.*)$")
 GENERATED = "pgadmin/static/js/generated"
 CLEAN_ENV = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C.UTF-8"}
+CONSTRAINTS = HERE / "constraints"
+# What Arcnix's launcher writes to pgAdmin's distribution config. pgAdmin
+# ignores names it does not know, so each must still exist in config.py.
+ARCNIX_SETTINGS = {
+    "SERVER_MODE": False, "MASTER_PASSWORD_REQUIRED": False, "USE_OS_SECRET_STORAGE": False,
+    "ALLOW_SAVE_PASSWORD": False, "ALLOW_SAVE_TUNNEL_PASSWORD": False, "UPGRADE_CHECK_ENABLED": False,
+}
+ARCNIX_PATHS = {
+    "DATA_DIR": "", "LOG_FILE": "pgadmin4.log", "SQLITE_PATH": "pgadmin4.db",
+    "SESSION_DB_PATH": "sessions", "STORAGE_DIR": "storage",
+    "AZURE_CREDENTIAL_CACHE_DIR": "azure", "KERBEROS_CCACHE_DIR": "kerberos",
+}
 
 
 def fetch(url, target, sha256):
@@ -82,8 +99,16 @@ def extract(archive, target):
         tar.extractall(target)
 
 
-def prepare(platform, version, work):
-    """A portable Python with the official pgAdmin wheel installed."""
+def pip(python, work, *arguments):
+    env = {**CLEAN_ENV, "HOME": str(work), "PIP_CONFIG_FILE": os.devnull, "PIP_NO_INPUT": "1",
+           "PIP_DISABLE_PIP_VERSION_CHECK": "1"}
+    return subprocess.run([python / "bin" / "python3", "-I", "-m", "pip", *arguments], env=env,
+                          check=True, stdout=subprocess.PIPE, text=True).stdout
+
+
+def prepare(platform, version, work, constraints):
+    """A portable Python with the official pgAdmin wheel installed. Without
+    `constraints`, pip resolves the newest matching dependencies."""
     pin = PINS["python"][platform]
     archive = work / "python.tar.gz"
     fetch(pin["url"], archive, pin["sha256"])
@@ -92,11 +117,17 @@ def prepare(platform, version, work):
     name, url, sha256 = official_wheel(version)
     wheel = work / name
     fetch(url, wheel, sha256)
-    env = {**CLEAN_ENV, "HOME": str(work), "PIP_CONFIG_FILE": os.devnull, "PIP_NO_INPUT": "1",
-           "PIP_DISABLE_PIP_VERSION_CHECK": "1"}
-    subprocess.run([python / "bin" / "python3", "-I", "-m", "pip", "install", "--no-cache-dir",
-                    "--prefer-binary", wheel], env=env, check=True)
+    pinned = ["--constraint", str(constraints)] if constraints else []
+    print(pip(python, work, "install", "--no-cache-dir", "--prefer-binary", *pinned, str(wheel)))
     return python, sha256
+
+
+def freeze(python, work, version, path):
+    """Record the dependency versions pip resolved for this pgAdmin."""
+    installed = pip(python, work, "freeze", "--all", "--exclude", "pgadmin4", "--exclude", "pip")
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(f"# Dependencies of pgAdmin {version}, resolved with build.py --freeze.\n"
+                    + installed, encoding="utf-8")
 
 
 def wanted(path, library):
@@ -193,16 +224,37 @@ def smoke_test(package, work):
     root = work / "check"
     unpack(package, root)
     manifest = json.loads((root / MANIFEST).read_text(encoding="utf-8"))
+    python, pgadmin = root / manifest["python"], root / manifest["pgadmin"]
     data = work / "data"
     data.mkdir()
-    settings = {
-        "DATA_DIR": str(data), "LOG_FILE": str(data / "pgadmin4.log"),
-        "SQLITE_PATH": str(data / "pgadmin4.db"), "SESSION_DB_PATH": str(data / "sessions"),
-        "STORAGE_DIR": str(data / "storage"), "SERVER_MODE": False,
-        "MASTER_PASSWORD_REQUIRED": False, "UPGRADE_CHECK_ENABLED": False,
-    }
+    settings = {**{name: str(data / path) for name, path in ARCNIX_PATHS.items()}, **ARCNIX_SETTINGS}
     distro = data / "config_distro.py"
     distro.write_text("".join(f"{name} = {value!r}\n" for name, value in settings.items()), encoding="utf-8")
+    config = (pgadmin / "config.py").read_text(encoding="utf-8")
+    unknown = [name for name in settings if not re.search(rf"^\s*{name} = ", config, re.M)]
+    reads_distro = "CONFIG_DISTRO_FILE_PATH" in (pgadmin / "pgadmin/evaluate_config.py").read_text(encoding="utf-8")
+    servers = data / "servers.json"
+    servers.write_text(json.dumps({"Servers": {"1": {
+        "Name": "check", "Group": "Arcnix", "Host": "127.0.0.1", "Port": 5432,
+        "MaintenanceDB": "postgres", "Username": "postgres",
+        "ConnectionParameters": {"sslmode": "prefer", "connect_timeout": 15},
+    }}}), encoding="utf-8")
+    setup_env = {**CLEAN_ENV, "HOME": str(data), "CONFIG_DISTRO_FILE_PATH": str(distro)}
+    for command in (["setup-db"], ["load-servers", str(servers)]):
+        subprocess.run([python, "-s", "-B", pgadmin / "setup.py", *command], cwd=data, env=setup_env,
+                       stdin=subprocess.DEVNULL, check=True)
+    # The columns Arcnix's launcher updates on every start.
+    with sqlite3.connect(data / "pgadmin4.db") as database:
+        saved = database.execute(
+            "SELECT server.host, server.port, server.maintenance_db, server.username FROM server "
+            "JOIN servergroup ON servergroup.id = server.servergroup_id "
+            "WHERE servergroup.name = 'Arcnix' AND server.name = 'check'").fetchall()
+    contract = {
+        "pgAdmin knows every setting Arcnix overrides" + (f" (missing: {', '.join(unknown)})" if unknown else ""): not unknown,
+        "pgAdmin reads CONFIG_DISTRO_FILE_PATH": reads_distro,
+        "setup-db and load-servers save the server where Arcnix updates it":
+            saved == [("127.0.0.1", 5432, "postgres", "postgres")],
+    }
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
@@ -213,7 +265,7 @@ def smoke_test(package, work):
     origin = f"http://127.0.0.1:{port}"
     with open(log, "wb") as output:
         backend = subprocess.Popen(
-            [root / manifest["python"], "-s", "-B", root / manifest["pgadmin"] / "pgAdmin4.py"],
+            [python, "-s", "-B", pgadmin / "pgAdmin4.py"],
             cwd=data, env=env, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
     try:
         deadline = time.monotonic() + 180
@@ -222,6 +274,7 @@ def smoke_test(package, work):
                 raise SystemExit("pgAdmin did not start:\n" + log.read_text(errors="replace")[-4000:])
             time.sleep(1)
         checks = {
+            **contract,
             "a request without the key is refused": status(f"{origin}/misc/ping") == 401,
             "the window page loads": 200 <= (status(f"{origin}/?key={key}") or 0) < 400,
             "the compiled interface is served": status(f"{origin}/static/js/generated/app.bundle.js?key={key}") == 200,
@@ -245,15 +298,25 @@ def main():
     parser.add_argument("--platform", required=True, choices=sorted(PINS["python"]))
     parser.add_argument("--frontend", type=Path, help="built web folder of the same release")
     parser.add_argument("--out", type=Path, default=HERE / "dist")
+    parser.add_argument("--freeze", action="store_true",
+                        help="resolve dependencies, write constraints/<version>.txt and stop")
     arguments = parser.parse_args()
     match = re.fullmatch(r"(\d+\.\d+)(\.post\d+)?", arguments.pgadmin)
     if not match or arguments.build < 1:
         raise SystemExit("Expected a version such as 9.19 and a build number from 1")
     version = match.group(1)
     output = arguments.out.resolve() / f"pgadmin-{arguments.pgadmin}-{arguments.build}-{arguments.platform}.zip"
+    constraints = CONSTRAINTS / f"{arguments.pgadmin}.txt"
+    if not arguments.freeze and not constraints.is_file():
+        raise SystemExit(f"Missing {constraints.relative_to(HERE)}. Run with --freeze, review and commit it.")
     with tempfile.TemporaryDirectory(prefix="pgadmin-component-") as temporary:
         work = Path(temporary)
-        python, wheel_sha256 = prepare(arguments.platform, arguments.pgadmin, work)
+        python, wheel_sha256 = prepare(arguments.platform, arguments.pgadmin, work,
+                                       None if arguments.freeze else constraints)
+        if arguments.freeze:
+            freeze(python, work, arguments.pgadmin, constraints)
+            print(f"Wrote {constraints.relative_to(HERE)}")
+            return
         frontend = arguments.frontend.resolve() if arguments.frontend else None
         pack(python, version, output, frontend)
         smoke_test(output, work)

@@ -12,7 +12,16 @@ against SHA-256 digests: PyPI's for the wheel, `pins.json` for Python.
 
 ## Publishing a build
 
-Run **Actions → Build pgAdmin component** with:
+For a new pgAdmin version, first pin its dependencies:
+
+```sh
+python3 -I build.py --pgadmin 9.20 --build 1 --platform macos-arm64 --freeze
+```
+
+Review `constraints/9.20.txt` and commit it. Builds refuse a version without
+one, so every component of a release uses the same dependency versions.
+
+Then run **Actions → Build pgAdmin component** with:
 
 - **pgadmin**: the version on PyPI, such as `9.19`.
 - **build**: `1` for a new pgAdmin version. Increase it to rebuild the same
@@ -22,7 +31,11 @@ Run **Actions → Build pgAdmin component** with:
   wheel (9.19 did) and waiting for a fixed one is not an option. The interface
   is then built from pgAdmin's `REL-x_y` tag with Node.js.
 
-Each platform's component is started once and checked before the release
+Each platform's component is checked before the release: every setting
+Arcnix overrides must still exist in pgAdmin, `setup.py setup-db` and
+`load-servers` must save a server where Arcnix's launcher updates it, and the
+backend must start, refuse requests without its key and serve its interface.
+Then the release
 `pgadmin-<version>-<build>` is published with the zips and `SHA256SUMS`.
 Arcnix pins each zip's URL, size and SHA-256 in `pgadmin.rs`, so a release is
 used only after an Arcnix change that names it.
