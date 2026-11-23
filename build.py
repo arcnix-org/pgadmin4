@@ -45,9 +45,11 @@ SKIP_BIN = re.compile(r"^(pip|idle|pydoc|2to3|python.*-config)")
 KEEP_DISCOVERY = re.compile(r"^(sqladmin.*|compute\.v1\.json|cloudresourcemanager.*)$")
 GENERATED = "pgadmin/static/js/generated"
 if WINDOWS:
-    # Python and pip need these on Windows; nothing else is inherited.
+    # Python, pip and pgAdmin's config need these on Windows, as in Arcnix's
+    # launcher; nothing else is inherited.
     CLEAN_ENV = {name: os.environ[name] for name in
-                 ("SystemRoot", "SYSTEMDRIVE", "TEMP", "TMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA")
+                 ("SystemRoot", "SYSTEMDRIVE", "TEMP", "TMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
+                  "CommonProgramFiles")
                  if name in os.environ}
     CLEAN_ENV["PATH"] = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
 else:
