@@ -286,11 +286,15 @@ def smoke_test(package, work):
         subprocess.run([python, "-s", "-B", pgadmin / "setup.py", *command], cwd=data, env=setup_env,
                        stdin=subprocess.DEVNULL, check=True)
     # The columns Arcnix's launcher updates on every start.
-    with sqlite3.connect(data / "pgadmin4.db") as database:
+    # Closed explicitly: Windows can't delete a file that is still open.
+    database = sqlite3.connect(data / "pgadmin4.db")
+    try:
         saved = database.execute(
             "SELECT server.host, server.port, server.maintenance_db, server.username FROM server "
             "JOIN servergroup ON servergroup.id = server.servergroup_id "
             "WHERE servergroup.name = 'Arcnix' AND server.name = 'check'").fetchall()
+    finally:
+        database.close()
     contract = {
         "pgAdmin knows every setting Arcnix overrides" + (f" (missing: {', '.join(unknown)})" if unknown else ""): not unknown,
         "pgAdmin reads CONFIG_DISTRO_FILE_PATH": reads_distro,
