@@ -7,7 +7,10 @@ and are only used to propose fixes to pgAdmin.
 
 A component is the official pgAdmin wheel from PyPI installed into a portable
 Python ([python-build-standalone](https://github.com/astral-sh/python-build-standalone)),
-packed as a zip with a `component.json` manifest. Both downloads are checked
+packed as a zip with a `component.json` manifest. Components are built for
+macOS on Apple Silicon (`macos-arm64`) and Windows (`windows-x64`). pgAdmin's
+regression tests and test data are left out: they aren't used at runtime and
+hold the longest paths, which Windows can't open without long-path support. Both downloads are checked
 against SHA-256 digests: PyPI's for the wheel, `pins.json` for Python.
 
 ## Publishing a build
@@ -29,7 +32,8 @@ Then run **Actions → Build pgAdmin component** with:
 - **build_frontend**: leave off. The build refuses a wheel without pgAdmin's
   compiled interface. Turn this on only when pgAdmin has published such a
   wheel (9.19 did) and waiting for a fixed one is not an option. The interface
-  is then built from pgAdmin's `REL-x_y` tag with Node.js.
+  is then built once from pgAdmin's `REL-x_y` tag with Node.js, and every
+  platform uses that build.
 
 Each platform's component is checked before the release: every setting
 Arcnix overrides must still exist in pgAdmin, `setup.py setup-db` and

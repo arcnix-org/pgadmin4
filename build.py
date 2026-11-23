@@ -36,12 +36,26 @@ HERE = Path(__file__).resolve().parent
 PINS = json.loads((HERE / "pins.json").read_text(encoding="utf-8"))
 MANIFEST = "component.json"
 EPOCH = (1980, 1, 1, 0, 0, 0)
-SKIP_TOP = {"include", "share"}
+WINDOWS = os.name == "nt"
+# Headers, import libraries, Tcl/Tk and Python's own command-line tools.
+SKIP_TOP = {"include", "share", "libs", "tcl", "Scripts"}
+SKIP_DLL = re.compile(r"^(_tkinter\.pyd|tcl\d+t?\.dll|tk\d+t?\.dll)$", re.I)
 SKIP_LIB = {"test", "idlelib", "tkinter", "ensurepip", "turtledemo", "lib2to3"}
 SKIP_BIN = re.compile(r"^(pip|idle|pydoc|2to3|python.*-config)")
 KEEP_DISCOVERY = re.compile(r"^(sqladmin.*|compute\.v1\.json|cloudresourcemanager.*)$")
 GENERATED = "pgadmin/static/js/generated"
-CLEAN_ENV = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C.UTF-8"}
+if WINDOWS:
+    # Python and pip need these on Windows; nothing else is inherited.
+    CLEAN_ENV = {name: os.environ[name] for name in
+                 ("SystemRoot", "SYSTEMDRIVE", "TEMP", "TMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA")
+                 if name in os.environ}
+    CLEAN_ENV["PATH"] = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
+else:
+    CLEAN_ENV = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C.UTF-8"}
+# Arcnix installs under C:\Users\<name>\AppData\Local\arcnix\Arcnix\data\components\pgadmin\<version>\,
+# about 75 characters for an 8-character user name. Python on Windows cannot
+# open longer paths than 260 characters unless long paths are enabled.
+MAX_WINDOWS_ENTRY = 180
 CONSTRAINTS = HERE / "constraints"
 # What Arcnix's launcher writes to pgAdmin's distribution config. pgAdmin
 # ignores names it does not know, so each must still exist in config.py.
@@ -99,10 +113,22 @@ def extract(archive, target):
         tar.extractall(target)
 
 
+def interpreter(python):
+    """The interpreter inside a python-build-standalone tree, relative to it."""
+    return Path("python.exe") if WINDOWS else Path("bin/python3")
+
+
+def site_library(python):
+    """Where the standard library and site-packages live, relative to the tree."""
+    if WINDOWS:
+        return Path("Lib")
+    return next(p.relative_to(python) for p in (python / "lib").glob("python3.*") if p.is_dir())
+
+
 def pip(python, work, *arguments):
     env = {**CLEAN_ENV, "HOME": str(work), "PIP_CONFIG_FILE": os.devnull, "PIP_NO_INPUT": "1",
            "PIP_DISABLE_PIP_VERSION_CHECK": "1"}
-    return subprocess.run([python / "bin" / "python3", "-I", "-m", "pip", *arguments], env=env,
+    return subprocess.run([python / interpreter(python), "-I", "-m", "pip", *arguments], env=env,
                           check=True, stdout=subprocess.PIPE, text=True).stdout
 
 
@@ -136,6 +162,8 @@ def wanted(path, library):
         return False
     if parts[0] in SKIP_TOP or (parts[0] == "bin" and SKIP_BIN.match(parts[1])):
         return False
+    if parts[0] == "DLLs" and len(parts) > 1 and SKIP_DLL.match(parts[1]):
+        return False
     if parts[0] == "lib" and len(parts) > 1 and re.match(r"^(tcl|tk|itcl|thread|pkgconfig)", parts[1]):
         return False
     if path.is_relative_to(library):
@@ -145,6 +173,10 @@ def wanted(path, library):
         if inner[:1] == ("site-packages",) and len(inner) > 1:
             if inner[1] == "pip" or inner[1].startswith("pip-") or inner[1:3] == ("pgadmin4", "docs"):
                 return False
+            # pgAdmin's regression suite and test data: not used at runtime,
+            # and they hold the longest paths.
+            if inner[1] == "pgadmin4" and ("tests" in inner[2:-1] or inner[2:3] == ("regression",)):
+                return False
             if inner[1:4] == ("googleapiclient", "discovery_cache", "documents"):
                 return len(inner) < 5 or bool(KEEP_DISCOVERY.match(inner[4]))
     return True
@@ -153,7 +185,7 @@ def wanted(path, library):
 def pack(python, version, output, frontend=None):
     """Write the component: documentation, tests and build tools left out,
     links stored as files, and one interpreter instead of its aliases."""
-    library = next(p.relative_to(python) for p in (python / "lib").glob("python3.*") if p.is_dir())
+    library = site_library(python)
     pgadmin = library / "site-packages" / "pgadmin4"
     generated = pgadmin / GENERATED
     if release(python / pgadmin) != version:
@@ -167,7 +199,7 @@ def pack(python, version, output, frontend=None):
     if not (compiled / "app.bundle.js").is_file():
         raise SystemExit("This pgAdmin wheel has no compiled interface. Build it from the same "
                          "release and pass --frontend, or wait for a fixed wheel.")
-    manifest = {"version": version, "python": "bin/python3", "pgadmin": pgadmin.as_posix()}
+    manifest = {"version": version, "python": interpreter(python).as_posix(), "pgadmin": pgadmin.as_posix()}
     output.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as package:
         def add(name, content, executable=False):
@@ -177,7 +209,8 @@ def pack(python, version, output, frontend=None):
             package.writestr(entry, content)
 
         add(MANIFEST, json.dumps(manifest))
-        add("bin/python3", (python / "bin/python3").resolve().read_bytes(), executable=True)
+        if not WINDOWS:
+            add("bin/python3", (python / "bin/python3").resolve().read_bytes(), executable=True)
         for path in sorted(python.rglob("*")):
             relative = path.relative_to(python)
             if relative.parts[0] == "bin" or not path.is_file() or not wanted(relative, library):
@@ -189,6 +222,13 @@ def pack(python, version, output, frontend=None):
             for path in sorted(compiled.rglob("*")):
                 if path.is_file() and path.suffix != ".map":
                     add((generated / path.relative_to(compiled)).as_posix(), path.read_bytes())
+    if WINDOWS:
+        with zipfile.ZipFile(output) as package:
+            long = [name for name in package.namelist() if len(name) > MAX_WINDOWS_ENTRY]
+        if long:
+            output.unlink()
+            raise SystemExit(f"{len(long)} paths are longer than {MAX_WINDOWS_ENTRY} characters, "
+                             f"such as {max(long, key=len)}")
 
 
 def unpack(package, target):
